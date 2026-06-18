@@ -1,0 +1,10 @@
+rawpy>=0.27.0
+imageio>=2.31
+tifffile>=2024.1
+numpy>=1.24
+Pillow>=10.0
+tqdm>=4.65
+scipy>=1.10
+scikit-learn>=1.0
+colour-demosaicing>=0.2.0
+scikit-image>=0.21
