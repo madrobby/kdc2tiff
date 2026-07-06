@@ -46,11 +46,18 @@ Usage:
     # Recalibrate from reference pairs
     python kdc2tiff.py --calibrate a.kdc a.tif [b.kdc b.tif ...]
 """
+
 from __future__ import annotations
+
+# Suppress specific warnings: deprecation warnings and colour-science's matplotlib notice
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", message=".*Matplotlib.*not available.*")
 
 import argparse
 import json
 import logging
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -61,6 +68,7 @@ import rawpy
 import tifffile
 from PIL import Image
 from tqdm import tqdm
+from colour_demosaicing import demosaicing_CFA_Bayer_Menon2007
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -148,9 +156,30 @@ def read_tiff_tag(kdc_path: Path, tag_id: int) -> Optional[object]:
                     return _struct.unpack_from('>H', vbytes, 0)[0]
                 elif type_id == 4:  # LONG
                     return _struct.unpack_from('>I', vbytes, 0)[0]
+                elif type_id == 5:  # RATIONAL (numerator, denominator)
+                    if count == 1 and len(vbytes) >= 8:
+                        num = _struct.unpack_from('>I', vbytes, 0)[0]
+                        denom = _struct.unpack_from('>I', vbytes, 4)[0]
+                        return f"{num}/{denom}" if denom else str(num)
+                    return vbytes.hex()[:20]
         return None
     except Exception:
         return None
+
+
+# TIFF/EXIF standard tag IDs
+_KDC_TAG_MAKE = 0x010F
+_KDC_TAG_MODEL = 0x0110
+_KDC_TAG_DATETIME_ORIGINAL = 0x9003
+_KDC_TAG_DATETIME_original = 0x132
+_KDC_TAG_EXPOSURE_TIME = 0x829A
+_KDC_TAG_FNUMBER = 0x829D
+_KDC_TAG_ISO_SPEED = 0x8827
+_KDC_TAG_FOCAL_LENGTH = 0x920A
+_KDC_TAG_FLASH = 0x9209
+_KDC_TAG_EXPOSURE_PROGRAM = 0x8822
+_KDC_TAG_WHITE_BALANCE = 0x8298
+_KDC_TAG_LIGHT_SOURCE = 0x828F
 
 def read_flash_tag(kdc_path: Path) -> bool:
     """Read the EXIF Flash tag (0x9209) from a KDC file.
@@ -175,7 +204,7 @@ def detect_camera(kdc_path: Path) -> str:
 
 def get_effective_params(params: dict, flash_fired: bool, camera: str = "DC120") -> dict:
     """Extract the effective linear+stretch params for a given flash state and camera.
-    
+
     For v20 (multi-camera): selects camera-specific flash/nonflash params.
     For v18/v19: uses flash/nonflash params (camera-agnostic).
     """
@@ -444,8 +473,6 @@ def should_skip(kdc_path: Path, out_path: Path, overwrite: bool) -> bool:
 # ---------------------------------------------------------------------------
 # 16-bit image resize with 7x oversampling
 # ---------------------------------------------------------------------------
-OVERSAMPLE_FACTOR = 7
-
 def resize_16bit_oversampled(arr_16: np.ndarray, target_w: int, target_h: int) -> np.ndarray:
     """Resize a 16-bit RGB array with 7x oversampling for higher quality.
 
@@ -485,15 +512,64 @@ def resize_16bit(arr_16: np.ndarray, target_w: int, target_h: int) -> np.ndarray
 # ---------------------------------------------------------------------------
 # Per-file conversion
 # ---------------------------------------------------------------------------
-def decode_kdc_16bit(kdc_path: Path, flash_fired: bool = False, camera: str = "DC120") -> tuple[np.ndarray, dict]:
+_RAWPY_DEMOSAIC = {
+    "ahd": rawpy.DemosaicAlgorithm.AHD,
+    "vng": rawpy.DemosaicAlgorithm.VNG,
+    "ppg": rawpy.DemosaicAlgorithm.PPG,
+    "lmmse": rawpy.DemosaicAlgorithm.LMMSE,
+    "amaze": rawpy.DemosaicAlgorithm.AMAZE,
+}
+
+
+def _available_rawpy_demosaics() -> list[str]:
+    """Return list of rawpy demosaic algorithm names available in this build."""
+    available = []
+    for name, algo in _RAWPY_DEMOSAIC.items():
+        try:
+            algo.checkSupported()
+            available.append(name)
+        except Exception:
+            pass
+    return available
+
+
+def decode_kdc_16bit(
+    kdc_path: Path,
+    flash_fired: bool = False,
+    camera: str = "DC120",
+    demosaic: Optional[str] = None,
+) -> tuple[np.ndarray, dict]:
     """Decode KDC with camera-specific demosaic and noise reduction.
 
-    DC120: Menon2007 demosaic (AMAZE-quality) — better channel alignment
-    DC50:  rawpy default demosaic (AHD) — handles 14-bit sensor gamma correctly
+    DC120: Menon2007 demosaic by default (AMAZE-quality, better channel alignment);
+           rawpy built-in algorithms (ahd/vng/ppg/lmmse/amaze) also available.
+    DC50:  rawpy AHD by default (handles 14-bit sensor gamma correctly);
+           other rawpy algorithms available via --demosaic.
 
     Both: median filter (1 pass), FBDD denoise for non-flash.
     """
     from scipy.ndimage import median_filter, gaussian_filter
+
+    # Read raw EXIF tags from KDC header before opening with rawpy
+    kdc_make = read_tiff_tag(kdc_path, _KDC_TAG_MAKE) or "Eastman Kodak Company"
+    kdc_model = read_tiff_tag(kdc_path, _KDC_TAG_MODEL) or ""
+    kdc_datetime = read_tiff_tag(kdc_path, _KDC_TAG_DATETIME_ORIGINAL) or read_tiff_tag(kdc_path, _KDC_TAG_DATETIME_original)
+    kdc_exposure_time = read_tiff_tag(kdc_path, _KDC_TAG_EXPOSURE_TIME)
+    kdc_fnumber = read_tiff_tag(kdc_path, _KDC_TAG_FNUMBER)
+    kdc_focal_length = read_tiff_tag(kdc_path, _KDC_TAG_FOCAL_LENGTH)
+    kdc_flash = read_tiff_tag(kdc_path, _KDC_TAG_FLASH)
+    kdc_exposure_program = read_tiff_tag(kdc_path, _KDC_TAG_EXPOSURE_PROGRAM)
+    kdc_white_balance = read_tiff_tag(kdc_path, _KDC_TAG_WHITE_BALANCE)
+    kdc_light_source = read_tiff_tag(kdc_path, _KDC_TAG_LIGHT_SOURCE)
+
+    # Determine effective demosaic algorithm per camera
+    if camera == "DC120":
+        effective_demosaic = demosaic if demosaic else "menon2007"
+    else:
+        effective_demosaic = demosaic if demosaic else "ahd"
+
+    use_colour_demosaicing = (effective_demosaic == "menon2007" and camera == "DC120")
+    use_rawpy_demosaic = effective_demosaic in _RAWPY_DEMOSAIC
 
     with rawpy.imread(str(kdc_path)) as raw:
         other = raw.other
@@ -519,23 +595,49 @@ def decode_kdc_16bit(kdc_path: Path, flash_fired: bool = False, camera: str = "D
                 "median_filter_passes": 1,
                 "fbdd_noise_reduction": not flash_fired,
             },
+            # EXIF tags copied from KDC header
+            "camera_make": kdc_make,
+            "camera_model": kdc_model.rstrip("\x00"),
+            "exif_datetime_original": kdc_datetime,
+            "exposure_time": kdc_exposure_time,
+            "fnumber": kdc_fnumber,
+            "exif_focal_length": kdc_focal_length,
+            "flash": kdc_flash,
+            "exposure_program": kdc_exposure_program,
+            "white_balance": str(kdc_white_balance) if kdc_white_balance else None,
+            "light_source": kdc_light_source,
         }
 
-        if camera == "DC50":
-            # DC50: use rawpy's default demosaic (handles 14-bit gamma correctly)
-            arr = raw.postprocess(output_bps=16)
-            meta["demosaic_algorithm"] = "AHD (rawpy default)"
-            meta["decode_dimensions"] = list(arr.shape[:2])
-        else:
-            # DC120: use Menon2007 demosaic (AMAZE-quality, better channel alignment)
-            from colour_demosaicing import demosaicing_CFA_Bayer_Menon2007
+        if use_colour_demosaicing:
+            # DC120 Menon2007: manual Bayer pipeline
             raw_bayer = raw.raw_image.copy().astype(np.float64)
             black_level = max(raw.black_level_per_channel[0], 0)
             pattern = raw.raw_pattern
-            meta["demosaic_algorithm"] = "Menon2007"
+            meta["demosaic_algorithm"] = "Menon2007 (colour-demosaicing)"
             meta["decode_dimensions"] = list(raw_bayer.shape)
+        elif use_rawpy_demosaic:
+            # rawpy built-in demosaic (any camera)
+            rawpy_algo = _RAWPY_DEMOSAIC[effective_demosaic]
+            try:
+                rawpy_algo.checkSupported()
+                arr = raw.postprocess(output_bps=16, demosaic_algorithm=rawpy_algo)
+                meta["demosaic_algorithm"] = f"{effective_demosaic.upper()} (rawpy)"
+            except Exception:
+                log.warning(
+                    "--demosaic %s is not available in this rawpy build "
+                    "(requires GPL pack); falling back to AHD.",
+                    effective_demosaic,
+                )
+                arr = raw.postprocess(output_bps=16)
+                meta["demosaic_algorithm"] = "AHD (rawpy default, fallback)"
+            meta["decode_dimensions"] = list(arr.shape[:2])
+        else:
+            # DC50 default: rawpy AHD
+            arr = raw.postprocess(output_bps=16)
+            meta["demosaic_algorithm"] = "AHD (rawpy default)"
+            meta["decode_dimensions"] = list(arr.shape[:2])
 
-    if camera != "DC50":
+    if use_colour_demosaicing:
         # Menon2007 demosaic for DC120
         raw_bayer = np.clip(raw_bayer - black_level, 0, white_level) / white_level
         color_map = {0: 'R', 1: 'G', 2: 'B', 3: 'G'}
@@ -564,7 +666,63 @@ def decode_kdc_16bit(kdc_path: Path, flash_fired: bool = False, camera: str = "D
     return arr, meta
 
 
-def write_tiff(arr: np.ndarray, out_path: Path, metadata: dict, bits: int) -> None:
+def _shutter_to_fraction(seconds: float) -> str:
+    """Convert shutter speed in seconds to EXIF-friendly fraction string."""
+    if seconds <= 0:
+        return "0/1"
+    reciprocal = round(1.0 / seconds)
+    if reciprocal >= 1:
+        return f"1/{reciprocal}"
+    # Sub-second (long exposure)
+    denom = round(seconds * 1000) / 1000
+    if denom == int(denom):
+        return f"{int(denom)}/1"
+    # Fractional: try to find simple fraction
+    denom_int = int(denom * 100)
+    import math
+    gcd = math.gcd(denom_int, 10000)
+    return f"{denom_int//gcd}/{10000//gcd}"
+
+
+def _timestamp_to_exif(dt) -> str:
+    """Format a datetime as EXIF DateTimeOriginal string (with colons)."""
+    if isinstance(dt, str):
+        # Handle ISO format "1994-01-01T00:03:04" -> "1994:01:01 00:03:04"
+        d = dt.replace("T", " ", 1)
+        parts = d.split(" ")
+        if len(parts) == 2:
+            return parts[0].replace("-", ":") + " " + parts[1][:8]
+        return d.replace("T", " ").replace("-", ":")[:19]
+    return dt.strftime("%Y:%m:%d %H:%M:%S")
+
+
+def _format_fnumber(aperture: float) -> str:
+    """Format f-number as EXIF fraction string."""
+    import math
+    # Multiply to eliminate decimals
+    val = round(aperture * 10)
+    gcd = math.gcd(val, 10)
+    return f"{val//gcd}/{10//gcd}"
+
+
+def _format_focallength(mm: float) -> str:
+    """Format focal length in mm."""
+    if mm == int(mm):
+        return f"{int(mm)} mm"
+    val = round(mm * 10)
+    import math
+    gcd = math.gcd(val, 10)
+    return f"{val//gcd}/{10//gcd} mm"
+
+
+def exiftool_write_tiff(arr: np.ndarray, out_path: Path, metadata: dict,
+                        bits: int) -> None:
+    """Write TIFF image and annotate with EXIF data using exiftool.
+
+    tifffile is used for the image; exiftool writes proper EXIF IFD tags
+    so tools like identify, exiftool, and standard image viewers can read
+    camera metadata (Make, Model, ExposureTime, FNumber, ISO, etc.).
+    """
     if bits == 16:
         if arr.dtype != np.uint16:
             raise ValueError(f"Expected uint16 for 16-bit output, got {arr.dtype}")
@@ -574,18 +732,114 @@ def write_tiff(arr: np.ndarray, out_path: Path, metadata: dict, bits: int) -> No
             raise ValueError(f"Expected uint8 for 8-bit output, got {arr.dtype}")
         software_tag = "kdc2tiff.py (rawpy 16-bit + linear color correction + Floyd-Steinberg dither)"
 
-    description = json.dumps(metadata, ensure_ascii=False, default=str)
     tifffile.imwrite(
         str(out_path), arr,
         photometric=TIFF_PHOTOMETRIC,
         compression=TIFF_COMPRESSION,
         resolution=TIFF_DPI,
         resolutionunit="inch",
-        description=description,
         software=software_tag,
         shaped=False,
         metadata=None,
     )
+
+    # Build exiftool command with proper EXIF tag mapping
+    def _sanitize(v):
+        """Remove embedded null bytes from string values for exiftool."""
+        if isinstance(v, str):
+            return v.replace('\x00', '').rstrip()
+        return v
+
+    exif_cmd = ["exiftool", "-overwrite_original"]
+
+    # Camera identity
+    make = metadata.get("camera_make") or "Eastman Kodak Company"
+    exif_cmd.append(f"-Make={_sanitize(make)}")
+
+    model = _sanitize(metadata.get("camera_model", ""))
+    if model:
+        exif_cmd.append(f"-Model={model}")
+
+    # DateTimeOriginal from KDC header or rawpy
+    dt = metadata.get("exif_datetime_original") or metadata.get("timestamp")
+    if dt:
+        exif_cmd.append(f"-DateTimeOriginal={_timestamp_to_exif(_sanitize(dt))}")
+
+    # ExposureTime
+    exposure = metadata.get("exposure_time") or metadata.get("shutter_speed")
+    if exposure:
+        if isinstance(exposure, str) and "/" in exposure:
+            # Already rational format from KDC header (e.g. "2772/100000")
+            exif_cmd.append(f"-ExposureTime={_sanitize(exposure)}")
+        else:
+            try:
+                exif_cmd.append(f"-ExposureTime={_shutter_to_fraction(float(exposure))}")
+            except (TypeError, ValueError):
+                pass
+
+    # FNumber
+    fnumber = metadata.get("fnumber") or metadata.get("aperture")
+    if fnumber:
+        if isinstance(fnumber, str) and "/" in fnumber:
+            exif_cmd.append(f"-FNumber={_sanitize(fnumber)}")
+        else:
+            try:
+                exif_cmd.append(f"-FNumber={_format_fnumber(float(fnumber))}")
+            except (TypeError, ValueError):
+                pass
+
+    # ISO Speed from KDC header tags or rawpy
+    iso = metadata.get("iso_speed")
+    if iso:
+        try:
+            exif_cmd.append(f"-ISO={int(float(iso))}")
+        except (TypeError, ValueError):
+            pass
+
+    # Focal Length
+    fl = metadata.get("exif_focal_length") or metadata.get("focal_length")
+    if fl:
+        if isinstance(fl, str) and "/" in fl:
+            # Already rational format (e.g. "37/1")
+            exif_cmd.append("-FocalLength=" + _sanitize(fl) + " mm")
+        else:
+            try:
+                exif_cmd.append(f"-FocalLength={_format_focallength(float(fl))}")
+            except (TypeError, ValueError):
+                pass
+
+    # White Balance
+    wb = metadata.get("white_balance")
+    if wb:
+        exif_cmd.append(f"-WhiteBalance={_sanitize(wb)}")
+
+    # Light Source
+    ls = metadata.get("light_source") or metadata.get("lightsource")
+    if ls:
+        exif_cmd.append(f"-LightSource={_sanitize(ls)}")
+
+    # Exposure Program
+    ep = metadata.get("exposure_program")
+    if ep:
+        exif_cmd.append(f"-ExposureProgram={ep}")
+
+    # Flash - prefer KDC header value if present
+    kdc_flash = metadata.get("flash")
+    if kdc_flash:
+        try:
+            flash_val = int(kdc_flash)
+        except (ValueError, TypeError):
+            flash_val = 31 if metadata.get("flash_fired") else 24
+        exif_cmd.append(f"-Flash={flash_val}")
+
+    # Only invoke exiftool if we have tags to write
+    if len(exif_cmd) > 2:
+        exif_cmd.append(str(out_path))
+        result = subprocess.run(
+            exif_cmd, capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            log.warning("exiftool failed for %s (ignoring): %s", out_path, result.stderr[:200])
 
 
 def convert_one(
@@ -594,6 +848,7 @@ def convert_one(
     bits: int = 16,
     dither: bool = True,
     stretch: bool = True,
+    demosaic: Optional[str] = None,
 ) -> str:
     """Convert a single KDC to TIFF."""
     if should_skip(kdc_path, out_path, overwrite):
@@ -607,8 +862,11 @@ def convert_one(
         output_h = cam_config["output_height"]
 
         # Stage 1: Camera-specific demosaic + median filter + FBDD (flash-aware)
-        arr_16, meta = decode_kdc_16bit(kdc_path, flash_fired=flash_fired, camera=camera)
+        arr_16, meta = decode_kdc_16bit(
+            kdc_path, flash_fired=flash_fired, camera=camera, demosaic=demosaic
+        )
         meta["camera"] = camera
+        meta["flash_fired"] = flash_fired
 
         # Stage 2: 7x oversampled resize (camera-specific dimensions)
         arr_16 = resize_16bit_oversampled(arr_16, output_w, output_h)
@@ -627,7 +885,8 @@ def convert_one(
         else:
             meta["color_correction"] = {"applied": False}
 
-        meta["pipeline"] = ["menon2007_demosaic", "resize_7x_oversample"]
+        demosaic_name = meta.get("demosaic_algorithm", "unknown")
+        meta["pipeline"] = [f"demosaic_{demosaic_name.lower().replace(' ', '_')}", "resize_7x_oversample"]
         if color_params is not None:
             meta["pipeline"].append("linear_color_correction")
             if stretch and "stretch" in color_params:
@@ -645,7 +904,7 @@ def convert_one(
         else:
             arr_out = arr_16
 
-        write_tiff(arr_out, out_path, meta, bits)
+        exiftool_write_tiff(arr_out, out_path, meta, bits)
         return "converted"
     except Exception as e:
         log.error("Failed to convert %s: %s", kdc_path, e, exc_info=True)
@@ -692,6 +951,15 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     parser.add_argument("--no-stretch", action="store_true",
                         help="Disable the percentile-based stretch (output may look dull; useful for comparison).")
     parser.add_argument("--verbose", "-v", action="store_true", help="Debug logging.")
+    rawpy_choices = list(_RAWPY_DEMOSAIC.keys())
+    all_demosaic_choices = ["menon2007"] + rawpy_choices
+    parser.add_argument(
+        "--demosaic",
+        choices=all_demosaic_choices,
+        default=None,
+        help=f"Demosaic algorithm (default: menon2007 for DC120, ahd for DC50). "
+             f"Available rawpy algorithms: {', '.join(rawpy_choices)}.",
+    )
     args = parser.parse_args(argv)
 
     setup_logging(args.verbose)
@@ -737,48 +1005,72 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         log.error("%s", e)
         return 1
 
-    log.info("Mode: %s, files: %d, output: %s, bits: %d, dither: %s, color_correction: %s, stretch: %s",
+    # Determine default demosaic per camera
+    demo_default = "menon2007"  # DC120 default
+    demo_effective = args.demosaic if args.demosaic else demo_default
+
+    log.info("Mode: %s, files: %d, output: %s, bits: %d, dither: %s, color_correction: %s, stretch: %s, demosaic: %s",
              mode, len(kdc_files),
              out_files[0].parent if mode == "dir" else out_files[0],
              args.bits, "off" if args.no_dither else "on",
              "on" if color_params else "off",
-             "off" if args.no_stretch else "on")
+             "off" if args.no_stretch else "on",
+             demo_effective)
 
     failures = []
     skipped = 0
     converted = 0
     start = time.time()
 
+    # ANSI color codes for progress bar
+    ANSI_GREEN = "\033[92m"
+    ANSI_YELLOW = "\033[93m"
+    ANSI_RED = "\033[91m"
+    ANSI_CYAN = "\033[96m"
+    ANSI_RESET = "\033[0m"
+
     iterator = kdc_files
     if mode == "dir":
-        iterator = tqdm(kdc_files, desc="Converting", unit="file")
+        iterator = tqdm(
+            kdc_files,
+            desc=f"{ANSI_CYAN}Converting{ANSI_RESET}",
+            unit="file",
+            dynamic_ncols=True,
+            bar_format=f"{ANSI_GREEN}{{l_bar}}{ANSI_RESET}{{bar}} {ANSI_YELLOW}{{n_fmt}}/{{total_fmt}}{ANSI_RESET} {ANSI_CYAN}{{elapsed}}<{ANSI_CYAN}{{remaining}}{ANSI_RESET}",
+        )
 
     for kdc, out in zip(iterator, out_files):
         try:
             result = convert_one(kdc, out, args.overwrite, color_params,
                                  bits=args.bits, dither=not args.no_dither,
-                                 stretch=not args.no_stretch)
+                                 stretch=not args.no_stretch,
+                                 demosaic=args.demosaic)
         except KeyboardInterrupt:
             log.warning("Interrupted by user.")
+            if iterator is not None and hasattr(iterator, 'close'):
+                iterator.close()
             return 130
         if result == "converted":
             converted += 1
             if mode == "file":
-                log.info("Converted %s -> %s (%d-bit)", kdc.name, out, args.bits)
+                log.info(f"{ANSI_GREEN}Converted{ANSI_RESET} %s -> %s (%d-bit)", kdc.name, out, args.bits)
         elif result == "skipped":
             skipped += 1
             if mode == "file":
-                log.info("Skipped (already converted): %s", out)
+                log.info(f"{ANSI_YELLOW}Skipped{ANSI_RESET} (already converted): %s", out)
         else:
             failures.append((kdc, result))
 
+    if iterator is not None and hasattr(iterator, 'close'):
+        iterator.close()
+
     elapsed = time.time() - start
-    log.info("Done in %.1fs — converted=%d, skipped=%d, failed=%d",
+    log.info(f"Done in {ANSI_CYAN}%.1fs{ANSI_RESET} — converted={ANSI_GREEN}%d{ANSI_RESET}, skipped={ANSI_YELLOW}%d{ANSI_RESET}, failed={ANSI_RED}%d{ANSI_RESET}",
              elapsed, converted, skipped, len(failures))
     if failures:
-        log.warning("Failed files:")
+        log.warning(f"{ANSI_RED}Failed files:{ANSI_RESET}")
         for path, reason in failures:
-            log.warning("  %s — %s", path, reason)
+            log.warning(f"  {ANSI_RED}%s{ANSI_RESET} — %s", path, reason)
         return 2 if converted == 0 else 0
     return 0
 
