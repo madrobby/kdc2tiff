@@ -14,7 +14,7 @@ Supports Kodak DC120 and DC50 digital cameras. Produces output that matches (as 
 - **Multi-camera support** — DC120 and DC50 with camera-specific processing
 - **EXIF metadata** — Make, Model, ExposureTime, FNumber, ISO, FocalLength, etc.
 - **Demosaic algorithms** — Menon2007, AHD, VNG, PPG (LMMSE/AMAZE with GPL packs)
-- **7× oversampled resize** — bicubic upsample + box downsample (configurable)
+- **7× oversampled resize** — bicubic upsample + configurable downscale (default: box, also lanczos/hamming/bilinear/bicubic/nearest)
 - **Batch processing** — convert entire directories in one command
 
 ## Installation
@@ -105,6 +105,31 @@ Available algorithms: `menon2007`, `ahd`, `vng`, `ppg`, `lmmse`, `amaze`
 
 Note: `lmmse` and `amaze` require GPL2/GPL3 demosaic packs (not included by default).
 
+**Choose a resize algorithm:**
+
+```bash
+# Default: box with 7× oversampling
+python kdc2tiff.py photo.KDC --resize lanczos
+python kdc2tiff.py photo.KDC --resize hamming
+python kdc2tiff.py photo.KDC --resize bilinear
+python kdc2tiff.py photo.KDC --resize bicubic
+python kdc2tiff.py photo.KDC --resize nearest
+```
+
+Available algorithms: `box`, `hamming`, `lanczos`, `bilinear`, `bicubic`, `nearest`
+
+**Skip the 7× oversampling step (single-pass resize):**
+
+```bash
+python kdc2tiff.py photo.KDC --no-oversample
+```
+
+**Enable noise reduction (median filter + FBDD denoising):**
+
+```bash
+python kdc2tiff.py photo.KDC --noise-reduction
+```
+
 **Disable color correction:**
 
 ```bash
@@ -115,6 +140,18 @@ python kdc2tiff.py photo.KDC --no-color-correction
 
 ```bash
 python kdc2tiff.py photo.KDC --no-stretch
+```
+
+**Use a custom params file:**
+
+```bash
+python kdc2tiff.py photo.KDC --params path/to/params.json
+```
+
+**8-bit output without dithering (may show banding):**
+
+```bash
+python kdc2tiff.py photo.KDC --bits 8 --no-dither
 ```
 
 **Overwrite existing files:**
@@ -128,6 +165,24 @@ python kdc2tiff.py ./kdc_folder/ --overwrite
 ```bash
 python kdc2tiff.py photo.KDC -v
 ```
+
+### All Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--calibrate KDC TIF [...]` | — | Rebuild `reference_lut.json` from reference pairs, then exit |
+| `-o, --output PATH` | auto | Output file or directory |
+| `--overwrite` | off | Reconvert even if output exists and is newer |
+| `--no-color-correction` | off | Skip color correction (rawpy output only) |
+| `--params PATH` | `reference_lut.json` | Path to color correction params JSON |
+| `--bits {8,16}` | 16 | Output bit depth |
+| `--no-dither` | off | Disable Floyd-Steinberg dithering (with `--bits 8`) |
+| `--no-stretch` | off | Disable percentile-based highlight stretch |
+| `--noise-reduction` | off | Enable median filter + FBDD noise reduction |
+| `--resize {box,hamming,lanczos,bilinear,bicubic,nearest}` | box | Resize algorithm |
+| `--no-oversample` | off | Skip 7× bicubic oversampling (single-pass resize) |
+| `--demosaic {menon2007,ahd,vng,ppg,lmmse,amaze}` | camera-specific | Demosaic algorithm |
+| `-v, --verbose` | off | Debug logging |
 
 ### Calibration
 
@@ -168,8 +223,8 @@ All EXIF tags from the KDC file are preserved and written to the TIFF:
 
 1. **Decode** — rawpy reads the KDC file (16-bit Bayer data)
 2. **Demosaic** — Menon2007 (DC120) or AHD/VNG/PPG (any camera)
-3. **Noise reduction** — median filter + FBDD-like denoising (non-flash only)
-4. **Resize** — 7× oversampled bicubic → Lanczos downsample
+3. **Noise reduction** — median filter + FBDD-like denoising (off by default, enable with `--noise-reduction`)
+4. **Resize** — 7× bicubic oversample + configurable downscale algorithm (default: `box`)
 5. **Color correction** — per-channel linear transform + percentile stretch
 6. **Write TIFF** — tifffile for image, exiftool for EXIF metadata
 
