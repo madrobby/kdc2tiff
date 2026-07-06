@@ -3,3 +3,5 @@
 venv
 samples
 *.png
+*.tif
+scripts/__pycache__/
