@@ -4,6 +4,8 @@ Convert 1990s Kodak KDC raw files to high-quality 16-bit TIFF with accurate colo
 
 Supports Kodak DC120 and DC50 digital cameras. Produces output that matches (as much as possible) the original Kodak software (Windows 3/95 conversion software) conversion, with full EXIF metadata preserved.
 
+There's a color correction LUT included that was made by converting  KDC files with the original Kodak software; but you can supply your own KDC/TIF pairs to match your specific camera better.
+
 *PLEASE NOTE:* This project is largely LLM-generated using locally run LLMs and is deliberately "quick and dirty" to convert these files without having to use the ancient Kodak software and fixing a few issues on the way (like much better demosaicing and not doing the extreme sharpening the Kodak software applies).
 
 ## Features
