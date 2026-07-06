@@ -1,15 +1,16 @@
 # kdc2tiff
 
-Convert 1990s Kodak KDC raw files to high-quality 16-bit TIFF with accurate color correction.
+Convert 90's Kodak KDC raw files (from the DC50 and DC120 cameras) to high-quality 16-bit TIFF with the goal of maximizing image quality through the use of modern demosaicing, color correction and scaling (no "AI" scaling).
 
-Supports Kodak DC120 and DC50 digital cameras. Produces output that matches (as much as possible) the original Kodak software (Windows 3/95 conversion software) conversion, with full EXIF metadata preserved.
+There's a color correction LUT included that was made by converting  KDC files with the original Kodak software (for Windows 3.11); you can also supply your own KDC/TIF pairs to match your specific camera better.
 
-There's a color correction LUT included that was made by converting  KDC files with the original Kodak software; but you can supply your own KDC/TIF pairs to match your specific camera better.
+The project goal is to be faithful to the original software's conversion but without introducing artifacts such as aggressive sharpening—and provide a basis for further manual processing in other tools (such as Lightroom).
 
 *PLEASE NOTE:* This project is largely LLM-generated using locally run LLMs and is deliberately "quick and dirty" to convert these files without having to use the ancient Kodak software and fixing a few issues on the way (like much better demosaicing and not doing the extreme sharpening the Kodak software applies).
 
 ## Features
 
+- **Defaults chosen to maximize quality** while avoiding some of the issues the orignal Kodak software exhibits, such as oversharpening and overfiltering
 - Outputs **16-bit TIFFs** or optionally **dithered 8-bit**
 - **Per-channel linear color correction** — calibrated from reference KDC/TIFF pairs (that were made with the original Kodak software)
 - **Flash-aware** — separate color params for flash and non-flash shots
@@ -186,7 +187,7 @@ python kdc2tiff.py photo.KDC -v
 | `--demosaic {menon2007,ahd,vng,ppg,lmmse,amaze}` | camera-specific | Demosaic algorithm |
 | `-v, --verbose` | off | Debug logging |
 
-### Calibration
+### Color Calibration
 
 Rebuild the color correction parameters from reference KDC/TIFF pairs:
 
@@ -207,8 +208,10 @@ This generates `reference_lut.json` with per-channel linear gains/offsets.
 
 | Camera | Output Size | Notes |
 |--------|-------------|-------|
-| DC120  | 1301 × 976  | Aspect ratio corrected (pixel_aspect ≈ 1.53) |
-| DC50   | 768 × 512   | Square pixels |
+| DC120  | 1301×976*   | Aspect ratio corrected (pixel_aspect ≈1.53) |
+| DC50   | 768×512     | Square pixels |
+
+_*The original Kodak software outputs these slightly cropped as 1280x960_
 
 ### Metadata
 
