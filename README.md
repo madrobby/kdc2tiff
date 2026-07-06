@@ -13,7 +13,7 @@ Supports Kodak DC120 and DC50 digital cameras. Produces output that matches (as 
 - **Flash-aware** — separate color params for flash and non-flash shots
 - **Multi-camera support** — DC120 and DC50 with camera-specific processing
 - **EXIF metadata** — Make, Model, ExposureTime, FNumber, ISO, FocalLength, etc.
-- **可选择 demosaic algorithms** — Menon2007, AHD, VNG, PPG (LMMSE/AMAZE with GPL packs)
+- **Demosaic algorithms** — Menon2007, AHD, VNG, PPG (LMMSE/AMAZE with GPL packs)
 - **7× oversampled resize** — bicubic upsample + Lanczos downsample for smooth results
 - **Floyd-Steinberg dithering** — optional 8-bit output without banding
 - **Batch processing** — convert entire directories in one command
