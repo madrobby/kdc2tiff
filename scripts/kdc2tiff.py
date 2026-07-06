@@ -43,6 +43,15 @@ Usage:
     # Disable color correction (rawpy output only)
     python kdc2tiff.py photo.kdc --no-color-correction
 
+    # Enable noise reduction
+    python kdc2tiff.py photo.kdc --noise-reduction
+
+    # Use Lanczos downscaling with oversampling (default is box)
+    python kdc2tiff.py photo.kdc --resize lanczos
+
+    # Single-pass resize without oversampling
+    python kdc2tiff.py photo.kdc --no-oversample
+
     # Recalibrate from reference pairs
     python kdc2tiff.py --calibrate a.kdc a.tif [b.kdc b.tif ...]
 """
@@ -473,38 +482,38 @@ def should_skip(kdc_path: Path, out_path: Path, overwrite: bool) -> bool:
 # ---------------------------------------------------------------------------
 # 16-bit image resize with 7x oversampling
 # ---------------------------------------------------------------------------
-def resize_16bit_oversampled(arr_16: np.ndarray, target_w: int, target_h: int) -> np.ndarray:
+def resize_16bit_oversampled(arr_16: np.ndarray, target_w: int, target_h: int, down_algo: str = "box") -> np.ndarray:
     """Resize a 16-bit RGB array with 7x oversampling for higher quality.
 
     Pipeline:
       1. Upscale each channel to 7x the target size (bicubic interpolation)
-      2. Downscale back to the target size (Lanczos interpolation)
+      2. Downscale back to the target size (specified algorithm)
 
-    This produces smoother results than a single-step resize, especially
-    for the non-uniform aspect ratio correction (848→1301 wide, 976→976 tall).
-    The oversampling gives the interpolator more data to work with, reducing
-    aliasing and blocking artifacts.
+    The bicubic upscale provides smooth interpolation for the enlargement,
+    while the downscale algorithm (box by default) handles anti-aliasing.
+    Box is preferred for downscaling because area-averaging is theoretically
+    optimal — it integrates the signal over each output pixel's footprint.
     """
     oversample_w = target_w * OVERSAMPLE_FACTOR
     oversample_h = target_h * OVERSAMPLE_FACTOR
+    algo = _RESIZE_ALGOS[down_algo]
 
     out = np.zeros((target_h, target_w, 3), dtype=np.uint16)
     for c in range(3):
         img = Image.fromarray(arr_16[..., c], mode="I;16")
-        # Step 1: upscale to 4x using bicubic (smooth upsampling)
         img_oversized = img.resize((oversample_w, oversample_h), Image.BICUBIC)
-        # Step 2: downscale to target using Lanczos (sharp downsampling)
-        img_final = img_oversized.resize((target_w, target_h), Image.LANCZOS)
+        img_final = img_oversized.resize((target_w, target_h), algo)
         out[..., c] = np.array(img_final)
     return out
 
 
-def resize_16bit(arr_16: np.ndarray, target_w: int, target_h: int) -> np.ndarray:
-    """Simple resize without oversampling (fallback)."""
+def resize_16bit(arr_16: np.ndarray, target_w: int, target_h: int, algo: str = "box") -> np.ndarray:
+    """Single-pass resize without oversampling."""
+    pil_algo = _RESIZE_ALGOS[algo]
     out = np.zeros((target_h, target_w, 3), dtype=np.uint16)
     for c in range(3):
         img = Image.fromarray(arr_16[..., c], mode="I;16")
-        img_resized = img.resize((target_w, target_h), Image.BILINEAR)
+        img_resized = img.resize((target_w, target_h), pil_algo)
         out[..., c] = np.array(img_resized)
     return out
 
@@ -518,6 +527,15 @@ _RAWPY_DEMOSAIC = {
     "ppg": rawpy.DemosaicAlgorithm.PPG,
     "lmmse": rawpy.DemosaicAlgorithm.LMMSE,
     "amaze": rawpy.DemosaicAlgorithm.AMAZE,
+}
+
+_RESIZE_ALGOS = {
+    "box": Image.BOX,
+    "hamming": Image.HAMMING,
+    "lanczos": Image.LANCZOS,
+    "bilinear": Image.BILINEAR,
+    "bicubic": Image.BICUBIC,
+    "nearest": Image.NEAREST,
 }
 
 
@@ -538,15 +556,17 @@ def decode_kdc_16bit(
     flash_fired: bool = False,
     camera: str = "DC120",
     demosaic: Optional[str] = None,
+    noise_reduction: bool = False,
 ) -> tuple[np.ndarray, dict]:
-    """Decode KDC with camera-specific demosaic and noise reduction.
+    """Decode KDC with camera-specific demosaic and optional noise reduction.
 
     DC120: Menon2007 demosaic by default (AMAZE-quality, better channel alignment);
            rawpy built-in algorithms (ahd/vng/ppg/lmmse/amaze) also available.
     DC50:  rawpy AHD by default (handles 14-bit sensor gamma correctly);
            other rawpy algorithms available via --demosaic.
 
-    Both: median filter (1 pass), FBDD denoise for non-flash.
+    Noise reduction (median filter + FBDD) is disabled by default.
+    Enable with --noise-reduction.
     """
     from scipy.ndimage import median_filter, gaussian_filter
 
@@ -594,6 +614,7 @@ def decode_kdc_16bit(
             "noise_reduction": {
                 "median_filter_passes": 1,
                 "fbdd_noise_reduction": not flash_fired,
+                "applied": noise_reduction,
             },
             # EXIF tags copied from KDC header
             "camera_make": kdc_make,
@@ -648,20 +669,23 @@ def decode_kdc_16bit(
         demosaiced = demosaicing_CFA_Bayer_Menon2007(raw_bayer, bayer_pattern)
         arr = np.clip(demosaiced * 65535, 0, 65535).astype(np.uint16)
 
-    # Median filter (1 pass) — smooths zipper artifacts and noise in flat areas
-    for c in range(3):
-        arr[..., c] = median_filter(arr[..., c], size=3, mode='reflect')
-
-    # FBDD-like noise reduction for non-flash scenes (dark scenes have more noise)
-    if not flash_fired:
-        arr_float = arr.astype(np.float64)
+    if noise_reduction:
+        # Median filter (1 pass) — smooths zipper artifacts and noise in flat areas
         for c in range(3):
-            ch = arr_float[..., c]
-            blurred = gaussian_filter(ch, sigma=0.8)
-            local_std = median_filter(np.abs(ch - blurred), size=5)
-            blend = np.clip(1.0 - local_std / 500.0, 0, 1) * 0.5
-            arr_float[..., c] = ch * (1 - blend) + blurred * blend
-        arr = np.clip(arr_float, 0, 65535).astype(np.uint16)
+            arr[..., c] = median_filter(arr[..., c], size=3, mode='reflect')
+
+        # FBDD-like noise reduction for non-flash scenes (dark scenes have more noise)
+        if not flash_fired:
+            arr_float = arr.astype(np.float64)
+            for c in range(3):
+                ch = arr_float[..., c]
+                blurred = gaussian_filter(ch, sigma=0.8)
+                local_std = median_filter(np.abs(ch - blurred), size=5)
+                blend = np.clip(1.0 - local_std / 500.0, 0, 1) * 0.5
+                arr_float[..., c] = ch * (1 - blend) + blurred * blend
+            arr = np.clip(arr_float, 0, 65535).astype(np.uint16)
+    else:
+        meta["noise_reduction"] = {"applied": False}
 
     return arr, meta
 
@@ -849,6 +873,9 @@ def convert_one(
     dither: bool = True,
     stretch: bool = True,
     demosaic: Optional[str] = None,
+    noise_reduction: bool = False,
+    resize_algo: str = "box",
+    oversample: bool = True,
 ) -> str:
     """Convert a single KDC to TIFF."""
     if should_skip(kdc_path, out_path, overwrite):
@@ -863,13 +890,19 @@ def convert_one(
 
         # Stage 1: Camera-specific demosaic + median filter + FBDD (flash-aware)
         arr_16, meta = decode_kdc_16bit(
-            kdc_path, flash_fired=flash_fired, camera=camera, demosaic=demosaic
+            kdc_path, flash_fired=flash_fired, camera=camera, demosaic=demosaic,
+            noise_reduction=noise_reduction,
         )
         meta["camera"] = camera
         meta["flash_fired"] = flash_fired
 
-        # Stage 2: 7x oversampled resize (camera-specific dimensions)
-        arr_16 = resize_16bit_oversampled(arr_16, output_w, output_h)
+        # Stage 2: resize (camera-specific dimensions)
+        if oversample:
+            arr_16 = resize_16bit_oversampled(arr_16, output_w, output_h, down_algo=resize_algo)
+            meta["resize_method"] = f"7x_bicubic_up_{resize_algo}_down"
+        else:
+            arr_16 = resize_16bit(arr_16, output_w, output_h, algo=resize_algo)
+            meta["resize_method"] = f"single_pass_{resize_algo}"
 
         # Stage 3: apply color correction (flash-aware, camera-specific)
         if color_params is not None:
@@ -886,7 +919,10 @@ def convert_one(
             meta["color_correction"] = {"applied": False}
 
         demosaic_name = meta.get("demosaic_algorithm", "unknown")
-        meta["pipeline"] = [f"demosaic_{demosaic_name.lower().replace(' ', '_')}", "resize_7x_oversample"]
+        meta["pipeline"] = [f"demosaic_{demosaic_name.lower().replace(' ', '_')}"]
+        if oversample:
+            meta["pipeline"].append("resize_7x_oversample")
+        meta["pipeline"].append(f"resize_{resize_algo}")
         if color_params is not None:
             meta["pipeline"].append("linear_color_correction")
             if stretch and "stretch" in color_params:
@@ -947,9 +983,20 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     parser.add_argument("--bits", type=int, choices=[8, 16], default=16,
                         help="Output bit depth: 16 (default, no banding) or 8 (with dithering).")
     parser.add_argument("--no-dither", action="store_true",
-                        help="When --bits 8, disable Floyd-Steinberg dithering (faster but may band).")
+                        help="When --bits 8, disable Floyd-Steinberg dithering (may show banding).")
     parser.add_argument("--no-stretch", action="store_true",
                         help="Disable the percentile-based stretch (output may look dull; useful for comparison).")
+    parser.add_argument("--noise-reduction", action="store_true",
+                        help="Enable median filter and FBDD noise reduction.")
+    resize_choices = list(_RESIZE_ALGOS.keys())
+    parser.add_argument(
+        "--resize",
+        choices=resize_choices,
+        default="box",
+        help=f"Downscaling algorithm (oversampled path) or single-pass algorithm (with --no-oversample). Default: box.",
+    )
+    parser.add_argument("--no-oversample", action="store_true",
+                        help="Skip the 7x bicubic oversampling step (single-pass resize only).")
     parser.add_argument("--verbose", "-v", action="store_true", help="Debug logging.")
     rawpy_choices = list(_RAWPY_DEMOSAIC.keys())
     all_demosaic_choices = ["menon2007"] + rawpy_choices
@@ -1009,13 +1056,16 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     demo_default = "menon2007"  # DC120 default
     demo_effective = args.demosaic if args.demosaic else demo_default
 
-    log.info("Mode: %s, files: %d, output: %s, bits: %d, dither: %s, color_correction: %s, stretch: %s, demosaic: %s",
+    log.info("Mode: %s, files: %d, output: %s, bits: %d, dither: %s, color_correction: %s, stretch: %s, demosaic: %s, noise_reduction: %s, resize: %s, oversample: %s",
              mode, len(kdc_files),
              out_files[0].parent if mode == "dir" else out_files[0],
              args.bits, "off" if args.no_dither else "on",
              "on" if color_params else "off",
              "off" if args.no_stretch else "on",
-             demo_effective)
+             demo_effective,
+             "on" if args.noise_reduction else "off",
+             args.resize,
+             "off" if args.no_oversample else "on")
 
     failures = []
     skipped = 0
@@ -1044,7 +1094,10 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             result = convert_one(kdc, out, args.overwrite, color_params,
                                  bits=args.bits, dither=not args.no_dither,
                                  stretch=not args.no_stretch,
-                                 demosaic=args.demosaic)
+                                 demosaic=args.demosaic,
+                                 noise_reduction=args.noise_reduction,
+                                 resize_algo=args.resize,
+                                 oversample=not args.no_oversample)
         except KeyboardInterrupt:
             log.warning("Interrupted by user.")
             if iterator is not None and hasattr(iterator, 'close'):
