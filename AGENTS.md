@@ -17,14 +17,14 @@ This is intentional — the tool is a focused utility with a clear pipeline:
 1. Read KDC file (rawpy)
 2. Demosaic Bayer pattern
 3. Noise reduction
-4. Resize with oversampling
+4. Sub-pixel shift fusion + resize with oversampling
 5. Apply color correction
 6. Write TIFF + EXIF (tifffile + exiftool)
 
 ### Key Components
 
 - **`decode_kdc_16bit()`** — Stage 1: demosaic, noise reduction, metadata extraction
-- **`resize_16bit_oversampled()`** — Stage 2: 7× bicubic → Lanczos resize
+- **`resize_16bit_oversampled()`** — Stage 2: sub-pixel shift fusion + 7× OpenCV Lanczos4 → configurable downscale
 - **`apply_color_correction()`** — Stage 3: per-channel linear transform
 - **`exiftool_write_tiff()`** — Stage 4: write image + metadata
 - **`convert_one()`** — Orchestrates the full pipeline for one file
@@ -82,6 +82,9 @@ python kdc2tiff.py samples/DC120/P002002.KDC --demosaic vng
 
 # Test 8-bit output
 python kdc2tiff.py samples/DC120/P002002.KDC --bits 8
+
+# Test without sub-pixel fusion (faster, may show stair-stepping)
+python kdc2tiff.py samples/DC120/P002002.KDC --no-subpixel-fusion
 ```
 
 ## Dependencies

@@ -17,7 +17,7 @@ The project goal is to be faithful to the original software's conversion but wit
 - **Multi-camera support** — DC120 and DC50 with camera-specific processing
 - **EXIF metadata** — Make, Model, ExposureTime, FNumber, ISO, FocalLength, etc.
 - **Demosaic algorithms** — Menon2007, AHD, VNG, PPG (LMMSE/AMAZE with GPL packs)
-- **7× oversampled resize** — bicubic upsample + configurable downscale (default: box, also lanczos/hamming/bilinear/bicubic/nearest)
+- **7× oversampled resize** — sub-pixel shift fusion + OpenCV Lanczos4 upsample + configurable downscale (default: box, also lanczos/hamming/bilinear/bicubic/nearest)
 - **Batch processing** — convert entire directories in one command
 
 ## Installation
@@ -182,8 +182,9 @@ python kdc2tiff.py photo.KDC -v
 | `--no-dither` | off | Disable Floyd-Steinberg dithering (with `--bits 8`) |
 | `--no-stretch` | off | Disable percentile-based highlight stretch |
 | `--noise-reduction` | off | Enable median filter + FBDD noise reduction |
-| `--resize {box,hamming,lanczos,bilinear,bicubic,nearest}` | box | Resize algorithm |
-| `--no-oversample` | off | Skip 7× bicubic oversampling (single-pass resize) |
+| `--resize {box,hamming,lanczos,bilinear,bicubic,nearest}` | box | Downscale algorithm (oversampled path) or single-pass algorithm |
+| `--no-oversample` | off | Skip 7× oversampling (single-pass resize) |
+| `--no-subpixel-fusion` | off | Disable sub-pixel shift fusion (4 shifted versions averaged before upscale) |
 | `--demosaic {menon2007,ahd,vng,ppg,lmmse,amaze}` | camera-specific | Demosaic algorithm |
 | `-v, --verbose` | off | Debug logging |
 
@@ -229,7 +230,7 @@ All EXIF tags from the KDC file are preserved and written to the TIFF:
 1. **Decode** — rawpy reads the KDC file (16-bit Bayer data)
 2. **Demosaic** — Menon2007 (DC120) or AHD/VNG/PPG (any camera)
 3. **Noise reduction** — median filter + FBDD-like denoising (off by default, enable with `--noise-reduction`)
-4. **Resize** — 7× bicubic oversample + configurable downscale algorithm (default: `box`)
+4. **Resize** — sub-pixel shift fusion + 7× OpenCV Lanczos4 upsample + configurable downscale algorithm (default: `box`)
 5. **Color correction** — per-channel linear transform + percentile stretch
 6. **Write TIFF** — tifffile for image, exiftool for EXIF metadata
 

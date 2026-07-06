@@ -526,30 +526,53 @@ def _sharpen_16bit_bilateral(arr: np.ndarray, amount: float, radius: int = 2, si
 # ---------------------------------------------------------------------------
 # 16-bit image resize with configurable oversampling
 # ---------------------------------------------------------------------------
-def resize_16bit_oversampled(arr_16: np.ndarray, target_w: int, target_h: int, down_algo: str = "box", oversample_factor: int = OVERSAMPLE_FACTOR, denoise_fn=None, sharpening: float = 0.0) -> tuple:
+def resize_16bit_oversampled(arr_16: np.ndarray, target_w: int, target_h: int, down_algo: str = "box", oversample_factor: int = OVERSAMPLE_FACTOR, denoise_fn=None, sharpening: float = 0.0, upscale_algo: str = "lanczos4", subpixel_fusion: bool = True) -> tuple:
     """Resize a 16-bit RGB array with configurable oversampling for higher quality.
 
-    Pipeline:
-      1. Upscale each channel to `oversample_factor`x the target size (bicubic interpolation)
+    Pipeline (subpixel_fusion=False):
+      1. Upscale to `oversample_factor`x the target size (OpenCV Lanczos4 or Catmull-Rom)
       2. Optional denoising on the upscaled image
       3. Optional bilateral unsharp mask sharpening (on the full RGB array)
       4. Downscale back to the target size (specified algorithm)
 
+    Pipeline (subpixel_fusion=True):
+      1. Generate 4 sub-pixel shifted versions of source ((0,0), (0.25,0), (0,0.25), (0.25,0.25))
+      2. Upscale each to `oversample_factor`x target size
+      3. Average the 4 upscaled images (true sub-pixel sampling)
+      4. Optional denoising/sharpening
+      5. Downscale to target size
+
     Returns (output_array, timing_dict) with per-substep timings.
     """
+    import cv2
+
     t = time.perf_counter
     timing = {}
     oversample_w = target_w * oversample_factor
     oversample_h = target_h * oversample_factor
     algo = _RESIZE_ALGOS[down_algo]
 
-    # Bicubic upscale all channels at once
+    # OpenCV upscale (single call on full RGB array for better performance)
     t0 = t()
-    oversized = np.zeros((oversample_h, oversample_w, 3), dtype=np.uint16)
-    for c in range(3):
-        img = Image.fromarray(arr_16[..., c], mode="I;16")
-        img_oversized = img.resize((oversample_w, oversample_h), Image.BICUBIC)
-        oversized[..., c] = np.array(img_oversized)
+    if upscale_algo == "catmull_rom":
+        cv2_interp = cv2.INTER_CATMULL_ROM
+    else:
+        cv2_interp = cv2.INTER_LANCZOS4
+
+    if subpixel_fusion:
+        # Generate 4 sub-pixel shifted versions and average them before upscaling
+        shifts = [(0.0, 0.0), (0.25, 0.0), (0.0, 0.25), (0.25, 0.25)]
+        shifted_sum = np.zeros_like(arr_16, dtype=np.float32)
+        for dx, dy in shifts:
+            # Create translation matrix for sub-pixel shift
+            M = np.float32([[1, 0, dx], [0, 1, dy]])
+            shifted = cv2.warpAffine(arr_16, M, (arr_16.shape[1], arr_16.shape[0]), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+            shifted_sum += shifted.astype(np.float32)
+        averaged = (shifted_sum / 4.0).clip(0, 65535).astype(np.uint16)
+        oversized = cv2.resize(averaged, (oversample_w, oversample_h), interpolation=cv2_interp)
+        timing["subpixel_shift"] = t() - t0
+    else:
+        oversized = cv2.resize(arr_16, (oversample_w, oversample_h), interpolation=cv2_interp)
     timing["upscale"] = t() - t0
 
     # Denoise and sharpen on the full RGB array (before per-channel downscale)
@@ -619,22 +642,24 @@ def _available_rawpy_demosaics() -> list[str]:
 
 
 def _denoise_16bit(arr: np.ndarray, flash_fired: bool = False) -> np.ndarray:
-    """Apply median filter + FBDD-like noise reduction to a 16-bit RGB array."""
-    from scipy.ndimage import median_filter, gaussian_filter
+    """Apply median filter + FBDD-like noise reduction to a 16-bit RGB array.
+
+    Uses OpenCV's native C++ filter implementations (cv2.medianBlur,
+    cv2.GaussianBlur) for all filtering operations, operating on the full
+    multi-channel array in a single call instead of per-channel loops.
+    """
+    import cv2
 
     # Median filter (1 pass) — smooths zipper artifacts and noise in flat areas
-    for c in range(3):
-        arr[..., c] = median_filter(arr[..., c], size=3, mode='reflect')
+    arr = cv2.medianBlur(arr, 3)
 
     # FBDD-like noise reduction for non-flash scenes (dark scenes have more noise)
     if not flash_fired:
-        arr_float = arr.astype(np.float64)
-        for c in range(3):
-            ch = arr_float[..., c]
-            blurred = gaussian_filter(ch, sigma=0.8)
-            local_std = median_filter(np.abs(ch - blurred), size=5)
-            blend = np.clip(1.0 - local_std / 500.0, 0, 1) * 0.5
-            arr_float[..., c] = ch * (1 - blend) + blurred * blend
+        arr_float = arr.astype(np.float32)
+        blurred = cv2.GaussianBlur(arr_float, (3, 3), sigmaX=0.8)
+        local_std = cv2.medianBlur(np.abs(arr_float - blurred), 5)
+        blend = np.clip(1.0 - local_std / 500.0, 0.0, 1.0) * 0.5
+        arr_float = arr_float * (1.0 - blend) + blurred * blend
         arr = np.clip(arr_float, 0, 65535).astype(np.uint16)
     return arr
 
@@ -948,6 +973,7 @@ def convert_one(
     resize_algo: str = "box",
     oversample_factor: int = OVERSAMPLE_FACTOR,
     sharpening: float = 0.0,
+    subpixel_fusion: bool = True,
 ) -> tuple:
     """Convert a single KDC to TIFF.
 
@@ -982,8 +1008,8 @@ def convert_one(
         t0 = t()
         denoise_fn = _denoise_16bit if noise_reduction else None
         if oversample_factor > 1:
-            arr_16, resize_subtiming = resize_16bit_oversampled(arr_16, output_w, output_h, down_algo=resize_algo, oversample_factor=oversample_factor, denoise_fn=denoise_fn, sharpening=sharpening)
-            meta["resize_method"] = f"{oversample_factor}x_bicubic_up_{resize_algo}_down"
+            arr_16, resize_subtiming = resize_16bit_oversampled(arr_16, output_w, output_h, down_algo=resize_algo, oversample_factor=oversample_factor, denoise_fn=denoise_fn, sharpening=sharpening, subpixel_fusion=subpixel_fusion)
+            meta["resize_method"] = f"{oversample_factor}x_lanczos4_up_{resize_algo}_down" + ("_subpixel" if subpixel_fusion else "")
         else:
             t0_resize = t()
             if denoise_fn is not None:
@@ -1105,6 +1131,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                         help="Oversampling factor for upscale-then-downscale resize. Default: 7. Use 1 to disable oversampling.")
     parser.add_argument("--sharpen", type=float, default=0.5,
                         help="Bilateral unsharp mask sharpening strength (0 = off, 0.5 = default). Only applied during oversampled resize.")
+    parser.add_argument("--no-subpixel-fusion", action="store_true",
+                        help="Disable sub-pixel shift fusion (default: enabled).")
     parser.add_argument("--verbose", "-v", action="store_true", help="Debug logging.")
     rawpy_choices = list(_RAWPY_DEMOSAIC.keys())
     all_demosaic_choices = ["menon2007"] + rawpy_choices
@@ -1207,7 +1235,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                                           noise_reduction=args.noise_reduction,
                                           resize_algo=args.resize,
                                           oversample_factor=1 if args.no_oversample else args.oversample,
-                                          sharpening=args.sharpen)
+                                          sharpening=args.sharpen,
+                                          subpixel_fusion=not args.no_subpixel_fusion)
         except KeyboardInterrupt:
             log.warning("Interrupted by user.")
             if iterator is not None and hasattr(iterator, 'close'):
