@@ -10,7 +10,7 @@ This file provides guidance for agents working on this project.
 
 ### Single Script
 
-The entire tool is implemented in a single file: `scripts/kdc2tiff.py`
+The entire tool is implemented in a single file: `kdc2tiff.py`
 
 This is intentional — the tool is a focused utility with a clear pipeline:
 
@@ -32,8 +32,8 @@ This is intentional — the tool is a focused utility with a clear pipeline:
 
 ### Configuration
 
-- **`scripts/reference_lut.json`** — Color correction parameters (gains/offsets per channel)
-- **`scripts/requirements.txt`** — Python dependencies
+- **`reference_lut.json`** — Color correction parameters (gains/offsets per channel)
+- **`requirements.txt`** — Python dependencies
 - **`.gitignore`** — Excludes `.venv/`, `samples/`, `*.tif`, etc.
 
 ## Conventions
@@ -72,16 +72,16 @@ No formal test suite exists. Manual testing with sample KDC files:
 
 ```bash
 # Test single file
-python scripts/kdc2tiff.py samples/DC120/P002002.KDC -o /tmp/test.tif
+python kdc2tiff.py samples/DC120/P002002.KDC -o /tmp/test.tif
 
 # Test directory batch
-python scripts/kdc2tiff.py samples/DC120/ -o /tmp/test_dir/
+python kdc2tiff.py samples/DC120/ -o /tmp/test_dir/
 
 # Test with different demosaic
-python scripts/kdc2tiff.py samples/DC120/P002002.KDC --demosaic vng
+python kdc2tiff.py samples/DC120/P002002.KDC --demosaic vng
 
 # Test 8-bit output
-python scripts/kdc2tiff.py samples/DC120/P002002.KDC --bits 8
+python kdc2tiff.py samples/DC120/P002002.KDC --bits 8
 ```
 
 ## Dependencies
@@ -137,7 +137,7 @@ The `reference_lut.json` file contains per-channel linear transform parameters:
 Calibrate from reference pairs:
 
 ```bash
-python scripts/kdc2tiff.py --calibrate a.KDC a.tif b.KDC b.tif
+python kdc2tiff.py --calibrate a.KDC a.tif b.KDC b.tif
 ```
 
 ## Camera Support

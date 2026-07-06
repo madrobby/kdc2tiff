@@ -302,10 +302,9 @@ kdc2tiff_project/
 ├── README.md                              ← quick-start guide
 ├── PROJECT_DOCUMENTATION.md               ← this file (detailed docs)
 ├── comparison_8pairs_flash_aware.png      ← visual A/B/C grid for all 8 pairs
-├── scripts/
-│   ├── kdc2tiff.py                        ← main CLI script (self-contained)
-│   ├── reference_lut.json                 ← v18 flash-aware params
-│   └── requirements.txt                   ← Python dependencies
+├── kdc2tiff.py                            ← main CLI script (self-contained)
+├── reference_lut.json                     ← v18 flash-aware params
+├── requirements.txt                       ← Python dependencies
 └── samples/
     ├── P002002_16bit.tif                  ← flash scene (cat, 16-bit)
     ├── P002002_8bit_dithered.tif          ← flash scene (cat, 8-bit dithered)
@@ -316,27 +315,27 @@ kdc2tiff_project/
 
 ```bash
 # Single file (auto-detects flash from EXIF)
-python scripts/kdc2tiff.py photo.kdc
+python kdc2tiff.py photo.kdc
 
 # 8-bit output with Floyd-Steinberg dithering
-python scripts/kdc2tiff.py photo.kdc --bits 8
+python kdc2tiff.py photo.kdc --bits 8
 
 # Directory mode (recursive, case-insensitive .kdc/.KDC)
-python scripts/kdc2tiff.py ./kdc_folder/
+python kdc2tiff.py ./kdc_folder/
 
 # Force re-conversion (ignore resume/skip)
-python scripts/kdc2tiff.py ./kdc_folder/ --overwrite
+python kdc2tiff.py ./kdc_folder/ --overwrite
 
 # Disable stretch (output may look dull)
-python scripts/kdc2tiff.py photo.kdc --no-stretch
+python kdc2tiff.py photo.kdc --no-stretch
 
 # Disable all color correction (rawpy output only)
-python scripts/kdc2tiff.py photo.kdc --no-color-correction
+python kdc2tiff.py photo.kdc --no-color-correction
 
 # Recalibrate from reference pairs
 # Flash pairs should be listed FIRST (the script detects flash from the KDC file,
 # not from the order, but listing flash pairs first is good practice)
-python scripts/kdc2tiff.py --calibrate \
+python kdc2tiff.py --calibrate \
     P002002.KDC P002002.TIF \
     P002008.KDC P002008.TIF \
     P002007.KDC P002007.TIF \
@@ -409,10 +408,10 @@ python3 -m venv venv
 source venv/bin/activate
 
 # 5. Install Python dependencies
-pip install -r scripts/requirements.txt
+pip install -r requirements.txt
 
 # 6. Verify the installation
-python scripts/kdc2tiff.py --help
+python kdc2tiff.py --help
 ```
 
 ### Linux (Debian/Ubuntu)
@@ -431,10 +430,10 @@ python3 -m venv venv
 source venv/bin/activate
 
 # 4. Install Python dependencies
-pip install -r scripts/requirements.txt
+pip install -r requirements.txt
 
 # 5. Verify the installation
-python scripts/kdc2tiff.py --help
+python kdc2tiff.py --help
 ```
 
 ### Linux (Fedora/RHEL/CentOS)
@@ -452,10 +451,10 @@ python3 -m venv venv
 source venv/bin/activate
 
 # 4. Install Python dependencies
-pip install -r scripts/requirements.txt
+pip install -r requirements.txt
 
 # 5. Verify the installation
-python scripts/kdc2tiff.py --help
+python kdc2tiff.py --help
 ```
 
 ### Linux (Arch Linux)
@@ -473,10 +472,10 @@ python -m venv venv
 source venv/bin/activate
 
 # 4. Install Python dependencies
-pip install -r scripts/requirements.txt
+pip install -r requirements.txt
 
 # 5. Verify the installation
-python scripts/kdc2tiff.py --help
+python kdc2tiff.py --help
 ```
 
 ### Troubleshooting
@@ -502,7 +501,7 @@ Make sure you're using the native Python (not Rosetta):
 arch -arm64 brew install libraw
 arch -arm64 python3 -m venv venv
 arch -arm64 source venv/bin/activate
-pip install -r scripts/requirements.txt
+pip install -r requirements.txt
 ```
 
 **"Permission denied" when installing packages**

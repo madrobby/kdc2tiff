@@ -45,7 +45,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 
 # 5. Install dependencies
-pip install -r scripts/requirements.txt
+pip install -r requirements.txt
 ```
 
 ### Linux
@@ -67,14 +67,14 @@ sudo dnf install ImageMagick-exiftool
 Convert a single KDC file to 16-bit TIFF:
 
 ```bash
-python scripts/kdc2tiff.py photo.KDC
+python kdc2tiff.py photo.KDC
 # Output: photo.tif (16-bit)
 ```
 
 Convert with 8-bit output and dithering:
 
 ```bash
-python scripts/kdc2tiff.py photo.KDC --bits 8
+python kdc2tiff.py photo.KDC --bits 8
 ```
 
 ### Batch Conversion
@@ -82,14 +82,14 @@ python scripts/kdc2tiff.py photo.KDC --bits 8
 Convert all KDC files in a directory:
 
 ```bash
-python scripts/kdc2tiff.py ./kdc_folder/
+python kdc2tiff.py ./kdc_folder/
 # Output: ./kdc_folder/_converted/*.tif
 ```
 
 Specify a custom output directory:
 
 ```bash
-python scripts/kdc2tiff.py ./kdc_folder/ --output ./tiff_folder/
+python kdc2tiff.py ./kdc_folder/ --output ./tiff_folder/
 ```
 
 ### Advanced Options
@@ -98,9 +98,9 @@ python scripts/kdc2tiff.py ./kdc_folder/ --output ./tiff_folder/
 
 ```bash
 # Default: Menon2007 for DC120, AHD for DC50
-python scripts/kdc2tiff.py photo.KDC --demosaic vng
-python scripts/kdc2tiff.py photo.KDC --demosaic ahd
-python scripts/kdc2tiff.py photo.KDC --demosaic ppg
+python kdc2tiff.py photo.KDC --demosaic vng
+python kdc2tiff.py photo.KDC --demosaic ahd
+python kdc2tiff.py photo.KDC --demosaic ppg
 ```
 
 Available algorithms: `menon2007`, `ahd`, `vng`, `ppg`, `lmmse`, `amaze`
@@ -110,25 +110,25 @@ Note: `lmmse` and `amaze` require GPL2/GPL3 demosaic packs (not included by defa
 **Disable color correction:**
 
 ```bash
-python scripts/kdc2tiff.py photo.KDC --no-color-correction
+python kdc2tiff.py photo.KDC --no-color-correction
 ```
 
 **Disable the percentile-based stretch:**
 
 ```bash
-python scripts/kdc2tiff.py photo.KDC --no-stretch
+python kdc2tiff.py photo.KDC --no-stretch
 ```
 
 **Overwrite existing files:**
 
 ```bash
-python scripts/kdc2tiff.py ./kdc_folder/ --overwrite
+python kdc2tiff.py ./kdc_folder/ --overwrite
 ```
 
 **Verbose logging:**
 
 ```bash
-python scripts/kdc2tiff.py photo.KDC -v
+python kdc2tiff.py photo.KDC -v
 ```
 
 ### Calibration
@@ -136,7 +136,7 @@ python scripts/kdc2tiff.py photo.KDC -v
 Rebuild the color correction parameters from reference KDC/TIFF pairs:
 
 ```bash
-python scripts/kdc2tiff.py --calibrate photo1.KDC photo1.tif photo2.KDC photo2.tif
+python kdc2tiff.py --calibrate photo1.KDC photo1.tif photo2.KDC photo2.tif
 ```
 
 This generates `reference_lut.json` with per-channel linear gains/offsets.

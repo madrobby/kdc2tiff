@@ -4,4 +4,4 @@ venv
 samples
 *.png
 *.tif
-scripts/__pycache__/
+__pycache__/
