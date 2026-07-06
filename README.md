@@ -8,16 +8,14 @@ Supports Kodak DC120 and DC50 digital cameras. Produces output that matches (as 
 
 ## Features
 
-- **16-bit output** — full 0–65535 precision per channel, no banding
-- **Per-channel linear color correction** — calibrated from reference KDC/TIFF pairs
+- Outputs **16-bit TIFFs** or optionally **dithered 8-bit**
+- **Per-channel linear color correction** — calibrated from reference KDC/TIFF pairs (that were made with the original Kodak software)
 - **Flash-aware** — separate color params for flash and non-flash shots
 - **Multi-camera support** — DC120 and DC50 with camera-specific processing
 - **EXIF metadata** — Make, Model, ExposureTime, FNumber, ISO, FocalLength, etc.
 - **Demosaic algorithms** — Menon2007, AHD, VNG, PPG (LMMSE/AMAZE with GPL packs)
-- **7× oversampled resize** — bicubic upsample + Lanczos downsample for smooth results
-- **Floyd-Steinberg dithering** — optional 8-bit output without banding
+- **7× oversampled resize** — bicubic upsample + box downsample (configurable)
 - **Batch processing** — convert entire directories in one command
-- **Colored terminal output** — progress bar with resize support
 
 ## Installation
 
