@@ -24,7 +24,7 @@ This is intentional — the tool is a focused utility with a clear pipeline:
 ### Key Components
 
 - **`decode_kdc_16bit()`** — Stage 1: demosaic, noise reduction, metadata extraction
-- **`resize_16bit_oversampled()`** — Stage 2: sub-pixel shift fusion + 7× OpenCV Lanczos4 → configurable downscale
+- **`resize_16bit_oversampled()`** — Stage 2: sub-pixel shift fusion + 2.5× OpenCV Lanczos4 → configurable downscale
 - **`apply_color_correction()`** — Stage 3: per-channel linear transform
 - **`exiftool_write_tiff()`** — Stage 4: write image + metadata
 - **`convert_one()`** — Orchestrates the full pipeline for one file

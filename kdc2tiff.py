@@ -52,7 +52,7 @@ Usage:
     # Single-pass resize without oversampling
     python kdc2tiff.py photo.kdc --no-oversample
 
-    # Use 4x oversampling instead of the default 7x
+    # Use 4x oversampling instead of the default 2.5x
     python kdc2tiff.py photo.kdc --oversample 4
 
     # Disable sharpening (default is 0.5)
@@ -99,7 +99,7 @@ TIFF_COMPRESSION = None
 KDC_EXTENSIONS = {".kdc"}
 DEFAULT_LUT_PATH = Path(__file__).resolve().parent / "reference_lut.json"
 LUT_VERSION = 20  # Multi-camera support
-OVERSAMPLE_FACTOR = 7
+OVERSAMPLE_FACTOR = 2.5
 
 # Camera-specific configurations
 CAMERA_CONFIGS = {
@@ -526,7 +526,7 @@ def _sharpen_16bit_bilateral(arr: np.ndarray, amount: float, radius: int = 2, si
 # ---------------------------------------------------------------------------
 # 16-bit image resize with configurable oversampling
 # ---------------------------------------------------------------------------
-def resize_16bit_oversampled(arr_16: np.ndarray, target_w: int, target_h: int, down_algo: str = "box", oversample_factor: int = OVERSAMPLE_FACTOR, denoise_fn=None, sharpening: float = 0.0, upscale_algo: str = "lanczos4", subpixel_fusion: bool = True) -> tuple:
+def resize_16bit_oversampled(arr_16: np.ndarray, target_w: int, target_h: int, down_algo: str = "box", oversample_factor: float = OVERSAMPLE_FACTOR, denoise_fn=None, sharpening: float = 0.0, upscale_algo: str = "lanczos4", subpixel_fusion: bool = True) -> tuple:
     """Resize a 16-bit RGB array with configurable oversampling for higher quality.
 
     Pipeline (subpixel_fusion=False):
@@ -548,8 +548,8 @@ def resize_16bit_oversampled(arr_16: np.ndarray, target_w: int, target_h: int, d
 
     t = time.perf_counter
     timing = {}
-    oversample_w = target_w * oversample_factor
-    oversample_h = target_h * oversample_factor
+    oversample_w = int(target_w * oversample_factor)
+    oversample_h = int(target_h * oversample_factor)
     algo = _RESIZE_ALGOS[down_algo]
 
     # OpenCV upscale (single call on full RGB array for better performance)
@@ -971,7 +971,7 @@ def convert_one(
     demosaic: Optional[str] = None,
     noise_reduction: bool = False,
     resize_algo: str = "box",
-    oversample_factor: int = OVERSAMPLE_FACTOR,
+    oversample_factor: float = OVERSAMPLE_FACTOR,
     sharpening: float = 0.0,
     subpixel_fusion: bool = True,
 ) -> tuple:
@@ -1127,8 +1127,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     )
     parser.add_argument("--no-oversample", action="store_true",
                         help="Alias for --oversample 1 (single-pass resize only).")
-    parser.add_argument("--oversample", type=int, default=7,
-                        help="Oversampling factor for upscale-then-downscale resize. Default: 7. Use 1 to disable oversampling.")
+    parser.add_argument("--oversample", type=float, default=2.5,
+                        help="Oversampling factor for upscale-then-downscale resize. Default: 2.5. Use 1 to disable oversampling.")
     parser.add_argument("--sharpen", type=float, default=0.5,
                         help="Bilateral unsharp mask sharpening strength (0 = off, 0.5 = default). Only applied during oversampled resize.")
     parser.add_argument("--no-subpixel-fusion", action="store_true",
