@@ -52,6 +52,15 @@ Usage:
     # Single-pass resize without oversampling
     python kdc2tiff.py photo.kdc --no-oversample
 
+    # Use 4x oversampling instead of the default 7x
+    python kdc2tiff.py photo.kdc --oversample 4
+
+    # Disable sharpening (default is 0.5)
+    python kdc2tiff.py photo.kdc --sharpen 0
+
+    # Strong sharpening
+    python kdc2tiff.py photo.kdc --sharpen 0.8
+
     # Recalibrate from reference pairs
     python kdc2tiff.py --calibrate a.kdc a.tif [b.kdc b.tif ...]
 """
@@ -480,31 +489,89 @@ def should_skip(kdc_path: Path, out_path: Path, overwrite: bool) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# 16-bit image resize with 7x oversampling
+# 16-bit bilateral sharpening (only used during oversampled resize)
 # ---------------------------------------------------------------------------
-def resize_16bit_oversampled(arr_16: np.ndarray, target_w: int, target_h: int, down_algo: str = "box") -> np.ndarray:
-    """Resize a 16-bit RGB array with 7x oversampling for higher quality.
+def _bilateral_blur(arr: np.ndarray, radius: int, sigma_color: float) -> np.ndarray:
+    """Bilateral blur using OpenCV's native C++ implementation.
+
+    Replaces the previous pure-numpy version which allocated (H, W, C, N)
+    intermediate arrays and was both memory-heavy and slow.
+    """
+    import cv2
+    # cv2.bilateralFilter only supports 8u and 32f, so convert uint16 → float32
+    arr_f32 = arr.astype(np.float32)
+    blurred_f32 = cv2.bilateralFilter(arr_f32, d=0, sigmaColor=sigma_color, sigmaSpace=radius)
+    return np.clip(blurred_f32, 0, 65535).astype(np.uint16)
+
+
+def _sharpen_16bit_bilateral(arr: np.ndarray, amount: float, radius: int = 2, sigma_color: float = 3000.0) -> np.ndarray:
+    """Bilateral unsharp mask sharpening for 16-bit RGB images.
+
+    Applies `original + amount * (original - bilateral_blur(original))`.
+    The bilateral blur preserves edges, so sharpening produces detail
+    enhancement without halo artifacts on high-contrast boundaries.
+
+    Only used during oversampled resize (on the upscaled intermediate image),
+    where a 2px radius corresponds to ~0.28px on final output — enough to
+    recover demosaic softness without amplifying noise.
+    """
+    if amount <= 0:
+        return arr
+    arr_f = arr.astype(np.float64)
+    blurred = _bilateral_blur(arr, radius, sigma_color)
+    result = arr_f + amount * (arr_f - blurred.astype(np.float64))
+    return np.clip(result, 0, 65535).astype(np.uint16)
+
+
+# ---------------------------------------------------------------------------
+# 16-bit image resize with configurable oversampling
+# ---------------------------------------------------------------------------
+def resize_16bit_oversampled(arr_16: np.ndarray, target_w: int, target_h: int, down_algo: str = "box", oversample_factor: int = OVERSAMPLE_FACTOR, denoise_fn=None, sharpening: float = 0.0) -> tuple:
+    """Resize a 16-bit RGB array with configurable oversampling for higher quality.
 
     Pipeline:
-      1. Upscale each channel to 7x the target size (bicubic interpolation)
-      2. Downscale back to the target size (specified algorithm)
+      1. Upscale each channel to `oversample_factor`x the target size (bicubic interpolation)
+      2. Optional denoising on the upscaled image
+      3. Optional bilateral unsharp mask sharpening (on the full RGB array)
+      4. Downscale back to the target size (specified algorithm)
 
-    The bicubic upscale provides smooth interpolation for the enlargement,
-    while the downscale algorithm (box by default) handles anti-aliasing.
-    Box is preferred for downscaling because area-averaging is theoretically
-    optimal — it integrates the signal over each output pixel's footprint.
+    Returns (output_array, timing_dict) with per-substep timings.
     """
-    oversample_w = target_w * OVERSAMPLE_FACTOR
-    oversample_h = target_h * OVERSAMPLE_FACTOR
+    t = time.perf_counter
+    timing = {}
+    oversample_w = target_w * oversample_factor
+    oversample_h = target_h * oversample_factor
     algo = _RESIZE_ALGOS[down_algo]
 
-    out = np.zeros((target_h, target_w, 3), dtype=np.uint16)
+    # Bicubic upscale all channels at once
+    t0 = t()
+    oversized = np.zeros((oversample_h, oversample_w, 3), dtype=np.uint16)
     for c in range(3):
         img = Image.fromarray(arr_16[..., c], mode="I;16")
         img_oversized = img.resize((oversample_w, oversample_h), Image.BICUBIC)
-        img_final = img_oversized.resize((target_w, target_h), algo)
+        oversized[..., c] = np.array(img_oversized)
+    timing["upscale"] = t() - t0
+
+    # Denoise and sharpen on the full RGB array (before per-channel downscale)
+    if denoise_fn is not None:
+        t0 = t()
+        oversized = denoise_fn(oversized)
+        timing["denoise"] = t() - t0
+    if sharpening > 0:
+        t0 = t()
+        oversized = _sharpen_16bit_bilateral(oversized, sharpening)
+        timing["sharpen"] = t() - t0
+
+    # Downscale each channel
+    t0 = t()
+    out = np.zeros((target_h, target_w, 3), dtype=np.uint16)
+    for c in range(3):
+        img = Image.fromarray(oversized[..., c], mode="I;16")
+        img_final = img.resize((target_w, target_h), algo)
         out[..., c] = np.array(img_final)
-    return out
+    timing["downscale"] = t() - t0
+
+    return out, timing
 
 
 def resize_16bit(arr_16: np.ndarray, target_w: int, target_h: int, algo: str = "box") -> np.ndarray:
@@ -551,24 +618,43 @@ def _available_rawpy_demosaics() -> list[str]:
     return available
 
 
+def _denoise_16bit(arr: np.ndarray, flash_fired: bool = False) -> np.ndarray:
+    """Apply median filter + FBDD-like noise reduction to a 16-bit RGB array."""
+    from scipy.ndimage import median_filter, gaussian_filter
+
+    # Median filter (1 pass) — smooths zipper artifacts and noise in flat areas
+    for c in range(3):
+        arr[..., c] = median_filter(arr[..., c], size=3, mode='reflect')
+
+    # FBDD-like noise reduction for non-flash scenes (dark scenes have more noise)
+    if not flash_fired:
+        arr_float = arr.astype(np.float64)
+        for c in range(3):
+            ch = arr_float[..., c]
+            blurred = gaussian_filter(ch, sigma=0.8)
+            local_std = median_filter(np.abs(ch - blurred), size=5)
+            blend = np.clip(1.0 - local_std / 500.0, 0, 1) * 0.5
+            arr_float[..., c] = ch * (1 - blend) + blurred * blend
+        arr = np.clip(arr_float, 0, 65535).astype(np.uint16)
+    return arr
+
+
 def decode_kdc_16bit(
     kdc_path: Path,
     flash_fired: bool = False,
     camera: str = "DC120",
     demosaic: Optional[str] = None,
-    noise_reduction: bool = False,
 ) -> tuple[np.ndarray, dict]:
-    """Decode KDC with camera-specific demosaic and optional noise reduction.
+    """Decode KDC with camera-specific demosaic.
 
     DC120: Menon2007 demosaic by default (AMAZE-quality, better channel alignment);
            rawpy built-in algorithms (ahd/vng/ppg/lmmse/amaze) also available.
     DC50:  rawpy AHD by default (handles 14-bit sensor gamma correctly);
            other rawpy algorithms available via --demosaic.
 
-    Noise reduction (median filter + FBDD) is disabled by default.
-    Enable with --noise-reduction.
+    Noise reduction is applied separately in the resize stage (on oversampled data)
+    or before single-pass resize. Enable with --noise-reduction.
     """
-    from scipy.ndimage import median_filter, gaussian_filter
 
     # Read raw EXIF tags from KDC header before opening with rawpy
     kdc_make = read_tiff_tag(kdc_path, _KDC_TAG_MAKE) or "Eastman Kodak Company"
@@ -611,11 +697,6 @@ def decode_kdc_16bit(
             "source_file": str(kdc_path),
             "source_bytes": kdc_path.stat().st_size,
             "resize_method": "7x_oversample_bicubic_lanczos",
-            "noise_reduction": {
-                "median_filter_passes": 1,
-                "fbdd_noise_reduction": not flash_fired,
-                "applied": noise_reduction,
-            },
             # EXIF tags copied from KDC header
             "camera_make": kdc_make,
             "camera_model": kdc_model.rstrip("\x00"),
@@ -668,24 +749,6 @@ def decode_kdc_16bit(
         bayer_pattern = pattern_map.get(bayer_str, 'GRBG')
         demosaiced = demosaicing_CFA_Bayer_Menon2007(raw_bayer, bayer_pattern)
         arr = np.clip(demosaiced * 65535, 0, 65535).astype(np.uint16)
-
-    if noise_reduction:
-        # Median filter (1 pass) — smooths zipper artifacts and noise in flat areas
-        for c in range(3):
-            arr[..., c] = median_filter(arr[..., c], size=3, mode='reflect')
-
-        # FBDD-like noise reduction for non-flash scenes (dark scenes have more noise)
-        if not flash_fired:
-            arr_float = arr.astype(np.float64)
-            for c in range(3):
-                ch = arr_float[..., c]
-                blurred = gaussian_filter(ch, sigma=0.8)
-                local_std = median_filter(np.abs(ch - blurred), size=5)
-                blend = np.clip(1.0 - local_std / 500.0, 0, 1) * 0.5
-                arr_float[..., c] = ch * (1 - blend) + blurred * blend
-            arr = np.clip(arr_float, 0, 65535).astype(np.uint16)
-    else:
-        meta["noise_reduction"] = {"applied": False}
 
     return arr, meta
 
@@ -866,6 +929,14 @@ def exiftool_write_tiff(arr: np.ndarray, out_path: Path, metadata: dict,
             log.warning("exiftool failed for %s (ignoring): %s", out_path, result.stderr[:200])
 
 
+def _print_timing(timing: dict) -> None:
+    """Print a per-stage timing breakdown for a converted file."""
+    if not timing:
+        return
+    parts = [f"{k}: {v:.3f}s" for k, v in timing.items()]
+    log.info("  timing: %s", ", ".join(parts))
+
+
 def convert_one(
     kdc_path: Path, out_path: Path, overwrite: bool,
     color_params: Optional[dict] = None,
@@ -875,36 +946,55 @@ def convert_one(
     demosaic: Optional[str] = None,
     noise_reduction: bool = False,
     resize_algo: str = "box",
-    oversample: bool = True,
-) -> str:
-    """Convert a single KDC to TIFF."""
+    oversample_factor: int = OVERSAMPLE_FACTOR,
+    sharpening: float = 0.0,
+) -> tuple:
+    """Convert a single KDC to TIFF.
+
+    Returns (status, timing) where status is "converted", "skipped", or
+    "failed: ..." and timing is a dict of {stage_name: seconds}.
+    """
     if should_skip(kdc_path, out_path, overwrite):
-        return "skipped"
+        return "skipped", {}
     try:
+        t = time.perf_counter
+        timing = {}
+
         # Detect camera and flash
+        t0 = t()
         camera = detect_camera(kdc_path)
         flash_fired = read_flash_tag(kdc_path)
         cam_config = CAMERA_CONFIGS.get(camera, CAMERA_CONFIGS["DC120"])
         output_w = cam_config["output_width"]
         output_h = cam_config["output_height"]
+        timing["camera_detect"] = t() - t0
 
-        # Stage 1: Camera-specific demosaic + median filter + FBDD (flash-aware)
+        # Stage 1: Camera-specific demosaic
+        t0 = t()
         arr_16, meta = decode_kdc_16bit(
             kdc_path, flash_fired=flash_fired, camera=camera, demosaic=demosaic,
-            noise_reduction=noise_reduction,
         )
         meta["camera"] = camera
         meta["flash_fired"] = flash_fired
+        timing["demosaic"] = t() - t0
 
-        # Stage 2: resize (camera-specific dimensions)
-        if oversample:
-            arr_16 = resize_16bit_oversampled(arr_16, output_w, output_h, down_algo=resize_algo)
-            meta["resize_method"] = f"7x_bicubic_up_{resize_algo}_down"
+        # Stage 2: resize (camera-specific dimensions), with optional denoising and sharpening on oversampled data
+        t0 = t()
+        denoise_fn = _denoise_16bit if noise_reduction else None
+        if oversample_factor > 1:
+            arr_16, resize_subtiming = resize_16bit_oversampled(arr_16, output_w, output_h, down_algo=resize_algo, oversample_factor=oversample_factor, denoise_fn=denoise_fn, sharpening=sharpening)
+            meta["resize_method"] = f"{oversample_factor}x_bicubic_up_{resize_algo}_down"
         else:
+            t0_resize = t()
+            if denoise_fn is not None:
+                arr_16 = denoise_fn(arr_16, flash_fired=flash_fired)
             arr_16 = resize_16bit(arr_16, output_w, output_h, algo=resize_algo)
             meta["resize_method"] = f"single_pass_{resize_algo}"
+            resize_subtiming = {"resize": t() - t0_resize}
+        timing.update(resize_subtiming)
 
         # Stage 3: apply color correction (flash-aware, camera-specific)
+        t0 = t()
         if color_params is not None:
             effective = get_effective_params(color_params, flash_fired, camera)
             arr_16 = apply_color_correction(arr_16, effective, stretch=stretch)
@@ -917,11 +1007,19 @@ def convert_one(
             }
         else:
             meta["color_correction"] = {"applied": False}
+        timing["color_correction"] = t() - t0
 
         demosaic_name = meta.get("demosaic_algorithm", "unknown")
         meta["pipeline"] = [f"demosaic_{demosaic_name.lower().replace(' ', '_')}"]
-        if oversample:
-            meta["pipeline"].append("resize_7x_oversample")
+        if noise_reduction:
+            if oversample_factor > 1:
+                meta["pipeline"].append("denoise_oversampled")
+            else:
+                meta["pipeline"].append("denoise")
+        if sharpening > 0 and oversample_factor > 1:
+            meta["pipeline"].append("sharpen_bilateral")
+        if oversample_factor > 1:
+            meta["pipeline"].append(f"resize_{oversample_factor}x_oversample")
         meta["pipeline"].append(f"resize_{resize_algo}")
         if color_params is not None:
             meta["pipeline"].append("linear_color_correction")
@@ -932,6 +1030,7 @@ def convert_one(
             meta["pipeline"].append("floyd_steinberg_dither" if dither else "truncate_to_8bit")
 
         # Stage 4: convert to 8-bit if requested
+        t0 = t()
         if bits == 8:
             if dither:
                 arr_out = convert_16bit_to_8bit_dithered(arr_16)
@@ -939,12 +1038,17 @@ def convert_one(
                 arr_out = convert_16bit_to_8bit_simple(arr_16)
         else:
             arr_out = arr_16
+        timing["convert_bits"] = t() - t0
 
+        # Stage 5: write TIFF + EXIF
+        t0 = t()
         exiftool_write_tiff(arr_out, out_path, meta, bits)
-        return "converted"
+        timing["write"] = t() - t0
+
+        return "converted", timing
     except Exception as e:
         log.error("Failed to convert %s: %s", kdc_path, e, exc_info=True)
-        return f"failed: {type(e).__name__}: {e}"
+        return f"failed: {type(e).__name__}: {e}", {}
 
 
 # ---------------------------------------------------------------------------
@@ -996,7 +1100,11 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         help=f"Downscaling algorithm (oversampled path) or single-pass algorithm (with --no-oversample). Default: box.",
     )
     parser.add_argument("--no-oversample", action="store_true",
-                        help="Skip the 7x bicubic oversampling step (single-pass resize only).")
+                        help="Alias for --oversample 1 (single-pass resize only).")
+    parser.add_argument("--oversample", type=int, default=7,
+                        help="Oversampling factor for upscale-then-downscale resize. Default: 7. Use 1 to disable oversampling.")
+    parser.add_argument("--sharpen", type=float, default=0.5,
+                        help="Bilateral unsharp mask sharpening strength (0 = off, 0.5 = default). Only applied during oversampled resize.")
     parser.add_argument("--verbose", "-v", action="store_true", help="Debug logging.")
     rawpy_choices = list(_RAWPY_DEMOSAIC.keys())
     all_demosaic_choices = ["menon2007"] + rawpy_choices
@@ -1056,7 +1164,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     demo_default = "menon2007"  # DC120 default
     demo_effective = args.demosaic if args.demosaic else demo_default
 
-    log.info("Mode: %s, files: %d, output: %s, bits: %d, dither: %s, color_correction: %s, stretch: %s, demosaic: %s, noise_reduction: %s, resize: %s, oversample: %s",
+    log.info("Mode: %s, files: %d, output: %s, bits: %d, dither: %s, color_correction: %s, stretch: %s, demosaic: %s, noise_reduction: %s, resize: %s, oversample: %dx, sharpen: %.2f",
              mode, len(kdc_files),
              out_files[0].parent if mode == "dir" else out_files[0],
              args.bits, "off" if args.no_dither else "on",
@@ -1065,7 +1173,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
              demo_effective,
              "on" if args.noise_reduction else "off",
              args.resize,
-             "off" if args.no_oversample else "on")
+             1 if args.no_oversample else args.oversample,
+             args.sharpen)
 
     failures = []
     skipped = 0
@@ -1091,13 +1200,14 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
     for kdc, out in zip(iterator, out_files):
         try:
-            result = convert_one(kdc, out, args.overwrite, color_params,
-                                 bits=args.bits, dither=not args.no_dither,
-                                 stretch=not args.no_stretch,
-                                 demosaic=args.demosaic,
-                                 noise_reduction=args.noise_reduction,
-                                 resize_algo=args.resize,
-                                 oversample=not args.no_oversample)
+            result, timing = convert_one(kdc, out, args.overwrite, color_params,
+                                          bits=args.bits, dither=not args.no_dither,
+                                          stretch=not args.no_stretch,
+                                          demosaic=args.demosaic,
+                                          noise_reduction=args.noise_reduction,
+                                          resize_algo=args.resize,
+                                          oversample_factor=1 if args.no_oversample else args.oversample,
+                                          sharpening=args.sharpen)
         except KeyboardInterrupt:
             log.warning("Interrupted by user.")
             if iterator is not None and hasattr(iterator, 'close'):
@@ -1107,6 +1217,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             converted += 1
             if mode == "file":
                 log.info(f"{ANSI_GREEN}Converted{ANSI_RESET} %s -> %s (%d-bit)", kdc.name, out, args.bits)
+                _print_timing(timing)
         elif result == "skipped":
             skipped += 1
             if mode == "file":
